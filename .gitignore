@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments and Secrets
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Databases and Stores
+*.db
+*.sqlite3
+*.sqlite
+
+# Build outputs
+dist/
+build/
+.output/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
