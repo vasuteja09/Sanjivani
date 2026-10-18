@@ -1,108 +1,140 @@
-import sys
-import os
 import json
-import asyncio
-import tempfile
 import logging
-from typing import List, Dict, Any
-from app.scanners.base import BaseScanner
-from app.core.config import get_settings
+import os
+import subprocess
+import sys
+import tempfile
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
-class BanditScanner(BaseScanner):
+
+class BanditScanner:
+    """Run Bandit to identify potential Python security issues."""
+
     def __init__(self):
         self.python_executable = sys.executable
 
-    async def is_available(self) -> bool:
+    def is_available(self):
+        """Check whether Bandit is installed and working."""
         try:
-            process = await asyncio.create_subprocess_exec(
-                self.python_executable, "-m", "bandit", "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            process = subprocess.run(
+                [
+                    self.python_executable,
+                    "-m",
+                    "bandit",
+                    "--version",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
-            stdout, _ = await process.communicate()
-            return process.returncode == 0 and b"bandit" in stdout.lower()
-        except Exception as e:
-            logger.error(f"Bandit availability check failed: {e}")
+
+            return process.returncode == 0
+
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Bandit availability check failed: %s", exc)
             return False
 
-    async def get_version(self) -> str:
+    def scan(self, code):
+        """Scan Python source code and return structured findings."""
+        temp_path = None
+
         try:
-            process = await asyncio.create_subprocess_exec(
-                self.python_executable, "-m", "bandit", "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, _ = await process.communicate()
-            output = stdout.decode().strip()
-            return output.splitlines()[0] if output else "1.9.4"
-        except Exception:
-            return "1.9.4"
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".py",
+                encoding="utf-8",
+                delete=False,
+            ) as temp_file:
+                temp_file.write(code)
+                temp_path = temp_file.name
 
-    async def scan_code(self, code: str, file_name: str, language: str) -> List[Dict[str, Any]]:
-        if language.lower() != "python":
-            raise ValueError(f"Bandit scanner only supports Python, requested: {language}")
-
-        # Securely create isolated temporary file
-        fd, temp_path = tempfile.mkstemp(prefix="sanjivani_scan_", suffix=".py")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(code)
-
-            cmd = [
-                self.python_executable,
-                "-m",
-                "bandit",
-                "-r",
-                temp_path,
-                "-f",
-                "json",
-                "-q"
-            ]
-
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            process = subprocess.run(
+                [
+                    self.python_executable,
+                    "-m",
+                    "bandit",
+                    "-f",
+                    "json",
+                    "-q",
+                    temp_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
 
-            try:
-                stdout_data, stderr_data = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=settings.SCAN_TIMEOUT_SECONDS
+            # Bandit can return a non-zero exit code when findings exist.
+            # Therefore, parse its JSON output instead of treating every
+            # non-zero return code as a scanner failure.
+            if not process.stdout.strip():
+                logger.error(
+                    "Bandit produced no JSON output. stderr: %s",
+                    process.stderr,
                 )
-            except asyncio.TimeoutError:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-                raise TimeoutError(f"Static code scan timed out after {settings.SCAN_TIMEOUT_SECONDS}s")
-
-            # Parse JSON output (Bandit returns exitcode 0 when 0 findings, 1 when findings exist)
-            raw_output = stdout_data.decode("utf-8", errors="replace").strip()
-            if not raw_output:
-                # Check stderr for parsing/syntax errors
-                err_text = stderr_data.decode("utf-8", errors="replace").strip()
-                if "syntaxerror" in err_text.lower():
-                    logger.warning(f"Python syntax error in submitted code: {err_text}")
-                    return []
-                return []
+                return {
+                    "success": False,
+                    "findings": [],
+                    "error": "Bandit did not return scan results.",
+                }
 
             try:
-                bandit_json = json.loads(raw_output)
-            except json.JSONDecodeError as jde:
-                logger.error(f"Failed to parse Bandit JSON output: {jde}, stdout={raw_output[:200]}")
-                return []
+                report = json.loads(process.stdout)
+            except json.JSONDecodeError:
+                logger.error(
+                    "Could not parse Bandit JSON output. stderr: %s",
+                    process.stderr,
+                )
+                return {
+                    "success": False,
+                    "findings": [],
+                    "error": "Invalid JSON returned by Bandit.",
+                }
 
-            results = bandit_json.get("results", [])
-            return results
+            findings = []
+
+            for result in report.get("results", []):
+                findings.append(
+                    {
+                        "test_id": result.get("test_id"),
+                        "test_name": result.get("test_name"),
+                        "issue_text": result.get("issue_text"),
+                        "issue_severity": result.get("issue_severity"),
+                        "issue_confidence": result.get("issue_confidence"),
+                        "line_number": result.get("line_number"),
+                        "filename": result.get("filename"),
+                        "more_info": result.get("more_info"),
+                    }
+                )
+
+            return {
+                "success": True,
+                "findings": findings,
+                "metrics": report.get("metrics", {}),
+            }
+
+        except subprocess.TimeoutExpired:
+            logger.warning("Bandit scan timed out.")
+            return {
+                "success": False,
+                "findings": [],
+                "error": "Bandit scan timed out.",
+            }
+
+        except OSError as exc:
+            logger.exception("Could not execute Bandit.")
+            return {
+                "success": False,
+                "findings": [],
+                "error": str(exc),
+            }
 
         finally:
-            # Guarantee cleanup of temporary file
-            try:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-            except Exception as e:
-                logger.warning(f"Failed to delete temp file {temp_path}: {e}")
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    logger.warning(
+                        "Could not remove temporary file: %s",
+                        temp_path,
+                    )
